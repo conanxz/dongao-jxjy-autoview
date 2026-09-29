@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.2.1
+// @version      2.2.2
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.2.1';
+  const VER = '2.2.2';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
@@ -72,10 +72,12 @@
   function withPause(url) {
     // v2.2.1：对称状态传递——跳转时把源页 running 状态带给目标页，
     // 否则跨域 localStorage 不同步（暂停后恢复，别的域还停在旧状态）
+    // v2.2.2：改用 #hash 传状态——hash 不发给服务器，不会触发平台
+    // 「Url的加密Key有异常」校验（query 加参数会被平台签名校验拒绝）
     try {
-      if (url.indexOf('dop_paused=1') === -1 && url.indexOf('dop_run=1') === -1) {
-        const r = loadState().running;
-        url += (url.indexOf('?') === -1 ? '?' : '&') + (r ? 'dop_run=1' : 'dop_paused=1');
+      if (url.indexOf('dop_run=1') === -1 && url.indexOf('dop_paused=1') === -1) {
+        const tag = loadState().running ? 'dop_run=1' : 'dop_paused=1';
+        url += (url.indexOf('#') === -1 ? '#' : '&') + tag;
       }
     } catch (e) {}
     return url;
@@ -1114,17 +1116,16 @@
   function main() {
     // v2.2.0：URL 携带 dop_paused=1 时，保持暂停并清掉参数
     try {
-      const m = location.search.match(/[?&](dop_paused|dop_run)=1/);
-      if (m) {
+      const hm = (location.hash || '').match(/dop_paused=1|dop_run=1/);
+      if (hm) {
         const st = loadState();
-        const wantRun = m[1] === 'dop_run';
+        const wantRun = hm[0] === 'dop_run=1';
         if (st.running !== wantRun) {
           st.running = wantRun; saveState(st);
           log(wantRun ? '▶ 跨页恢复运行（由上一页状态同步）' : '⏸ 跨页保持暂停（由上一页状态同步）');
         }
-        history.replaceState(null, '', location.pathname + location.search
-          .replace(/[?&]dop_paused=1/, '').replace(/[?&]dop_run=1/, '')
-          .replace(/^\?$/, '').replace(/\?&/, '?'));
+        const h = location.hash.replace(/[#&](dop_paused=1|dop_run=1)/g, '').replace(/^#&?/, '');
+        history.replaceState(null, '', location.pathname + location.search + (h ? '#' + h : ''));
       }
     } catch (e) {}
     const u = location.href;
