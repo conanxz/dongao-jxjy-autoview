@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.1.2
+// @version      2.2.0
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.1.2';
+  const VER = '2.2.0';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
@@ -68,6 +68,17 @@
   function recReset() { writeJson(REC_KEY, { n: 0, ts: Date.now(), log: [] }); }
 
   // 异常恢复：回到浙江门户入口，重新识别登录态/免验证登录
+  // —— 跨页保持暂停（v2.2.0）：跳转 URL 带 dop_paused=1，新页读到即保持暂停 ——
+  function withPause(url) {
+    try {
+      if (!loadState().running && url.indexOf('dop_paused=1') === -1) {
+        url += (url.indexOf('?') === -1 ? '?' : '&') + 'dop_paused=1';
+      }
+    } catch (e) {}
+    return url;
+  }
+  function go(url) { window.location.href = withPause(url); }
+
   function goRecover(where) {
     const n = recBump(where);
     if (n > MAX_REC) {
@@ -80,7 +91,7 @@
     }
     log('异常恢复(' + n + '/' + MAX_REC + ')：' + where + ' → 回浙江门户入口');
     setStatus('🟡 会话异常，恢复中…');
-    window.location.href = ENTRY_URL;
+    go(ENTRY_URL);
   }
 
   function saveBreak(tag) {
@@ -291,7 +302,7 @@
         try { abs = new URL(url, location.href).href; } catch (e) { abs = null; }
         if (abs && /^https?:/i.test(abs)) {
           log('拦截 window.open → 同标签跳转:', abs);
-          window.location.href = abs;
+          go(abs);
           return null;
         }
       }
@@ -308,7 +319,7 @@
         const url = new URL(href, location.href);
         if (!/^https?:/i.test(url.protocol)) return false;
         log('拦截新标签点击 → 同标签跳转:', url.href);
-        window.location.href = url.href;
+        go(url.href);
         return true;
       } catch (e) { return false; }
     }
@@ -442,7 +453,7 @@
       probes++;
       if (probes <= 20) { setTimeout(step, 1500); return; }
       log('登录态持续无法识别（探测30秒），放行到学习首页，由那边兜底裁决');
-      window.location.href = INDEX_URL;
+      go(INDEX_URL);
     };
     log('当前：浙江门户入口，开始识别登录状态');
     step();
@@ -455,7 +466,7 @@
   function startPortalEntry() {
     log('走浙江门户链重建学习会话（golearncenter→选学校→东奥继续学习）');
     setStage('golearn');
-    window.location.href = 'https://jxjy.czt.zj.gov.cn/front/golearncenterNew.html';
+    go('https://jxjy.czt.zj.gov.cn/front/golearncenterNew.html');
   }
 
   function onZjPortal() {
@@ -475,7 +486,7 @@
         if (++n <= 12) { setTimeout(go, 1500); return; }
         log('未找到「继续学习」链接，直接进选学校页');
         setStage('select');
-        window.location.href = 'https://jxjy.czt.zj.gov.cn/front/goSelectSchoolNew.html?syear=' + currentYear();
+        go('https://jxjy.czt.zj.gov.cn/front/goSelectSchoolNew.html?syear=' + currentYear());
       };
       go();
       return;
@@ -494,7 +505,7 @@
         if (++n <= 12) { setTimeout(go, 1500); return; }
         clrStage();
         log('选学校页未找到「继续学习」，退回学习首页');
-        window.location.href = INDEX_URL;
+        go(INDEX_URL);
       };
       go();
       return;
@@ -527,7 +538,7 @@
         setTimeout(go, 1500);
       } else {
         log('未找到「去学习」入口，直接尝试课程列表地址兜底');
-        window.location.href = myCourseUrl();
+        go(myCourseUrl());
       }
     };
     go();
@@ -631,7 +642,7 @@
             log('同一讲刚学完但平台未确认完成，视为已完成，返回课程列表换下一门（防死循环）');
             setStatus('✅ 该讲已学完（防重入），返回课程列表');
             saveBreak('防重入跳过讲次:' + targetTitle);
-            window.location.href = myCourseUrl();
+            go(myCourseUrl());
             return;
           }
         }
@@ -657,7 +668,7 @@
       }
       log('本课程所有讲已学完，返回我的课程');
       setStatus('✅ 本课程已完成，返回课程列表');
-      window.location.href = myCourseUrl();
+      go(myCourseUrl());
     };
     pick();
   }
@@ -1063,10 +1074,10 @@
     try { back = sessionStorage.getItem('dongao_lecture_list'); } catch (e) {}
     if (back) {
       log('返回课程目录（继续下一讲）：', back);
-      window.location.href = back;
+      go(back);
     } else {
       log('无列表记录（单视频课程），退回我的课程页');
-      window.location.href = myCourseUrl();
+      go(myCourseUrl());
     }
   }
 
@@ -1098,6 +1109,15 @@
   // ═══ 路由 ═══
   let midPageTries = 0;
   function main() {
+    // v2.2.0：URL 携带 dop_paused=1 时，保持暂停并清掉参数
+    try {
+      if (/[?&]dop_paused=1/.test(location.search)) {
+        const st = loadState();
+        if (st.running) { st.running = false; saveState(st); }
+        log('⏸ 跨页保持暂停（由上一页暂停状态传递）');
+        history.replaceState(null, '', location.pathname + location.search.replace(/[?&]dop_paused=1/, '').replace(/^\?$/, '') );
+      }
+    } catch (e) {}
     const u = location.href;
     const host = location.hostname;
     const s = loadState();
