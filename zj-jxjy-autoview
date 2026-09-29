@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         东奥会计继续教育看课自动答题
+// @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.1.2
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.1.0';
+  const VER = '2.1.2';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
@@ -664,6 +664,7 @@
 
   // ═══ E. 视频播放页：答题 + 放完检测 + 看门狗 + 会话保活 ═══
   let quizGen = 0;            // 答题循环代际（重入时作废旧循环）
+  let popupGen = 0;           // 超时弹窗看门狗代际
   let keepAliveTimer = null;
   let videoLoopsStarted = false;
 
@@ -681,6 +682,7 @@
     setStatus('🟢 运行中｜视频播放页');
     saveBreak('视频页');
     startQuizWatcher();
+    startTimeoutPopupWatcher();
     startKeepAlive();
     if (!videoLoopsStarted) {
       videoLoopsStarted = true;
@@ -738,6 +740,40 @@
         } catch (e) { log('点确定异常：', e.message); }
         schedule();
       }, 500);
+    }
+  }
+
+  // —— 超时弹窗看门狗（v2.1.1：「听课页面已超时」→自动点「退出听课」）——
+  function startTimeoutPopupWatcher() {
+    const gen = ++popupGen;
+    detect();
+    function schedule() { setTimeout(detect, 3000); }
+    function detect() {
+      if (gen !== popupGen) return;
+      if (!loadState().running) { schedule(); return; }
+      try {
+        if (!findTimeoutPopup(document)) {
+          const frames = document.querySelectorAll('iframe');
+          for (const f of frames) {
+            try { const d = f.contentDocument; if (d && findTimeoutPopup(d)) break; } catch (e) {}
+          }
+        }
+      } catch (e) {
+        log('超时弹窗检测异常：', e.message);
+      }
+      schedule();
+    }
+    function findTimeoutPopup(root) {
+      const marker = [...root.querySelectorAll('div,span,p,h3,h4')].find(el => {
+        const t = (el.textContent || '').trim();
+        return t && t.length < 60 && /听课页面已超时|已超时[，,]?\s*请重新进入/.test(t);
+      });
+      if (!marker) return false;
+      // 实测：点「退出听课」会直接关闭网页。
+      // 正确做法：不点任何按钮，直接走恢复链回浙江门户入口重进。
+      log('⚠️ 检测到听课超时弹窗（不点退出，直接走恢复链重进）');
+      setTimeout(() => goRecover('听课超时'), 500);
+      return true;
     }
   }
 
