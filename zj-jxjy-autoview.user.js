@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.3.1
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.3.0';
+  const VER = '2.3.1';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
@@ -615,14 +615,35 @@
     return null;
   }
 
+  // v2.3.1：学分表格可能异步渲染，退避重试直到解析成功
+  let creditGen = 0;
+  function startCreditScanner() {
+    const gen = ++creditGen;
+    let n = 0;
+    const tryOnce = () => {
+      if (gen !== creditGen) return;
+      n++;
+      const cr = parseCredits();
+      if (cr) {
+        writeJson(CREDIT_KEY, cr);
+        setCredit();
+        log('📊 总进度统计：' + cr.earned + ' / ' + cr.total + ' 学分（' + (cr.earned / cr.total * 100).toFixed(1) + '%）');
+        return;
+      }
+      if (n <= 8) {
+        if (n === 1) log('学分表格未就绪，稍后重试…');
+        setTimeout(tryOnce, 500 * n);
+      } else {
+        const nT = document.querySelectorAll('table').length;
+        log('⚠️ 学分统计失败：重试' + (n - 1) + '次未取到数据（页面table数=' + nT + '）');
+      }
+    };
+    tryOnce();
+  }
+
   function onMyCourse() {
     // v2.3.0：进我的课程页就刷新学分总进度（暂停状态也统计）
-    const cr = parseCredits();
-    if (cr) {
-      writeJson(CREDIT_KEY, cr);
-      setCredit();
-      log('📊 总进度统计：' + cr.earned + ' / ' + cr.total + ' 学分（' + (cr.earned / cr.total * 100).toFixed(1) + '%）');
-    }
+    startCreditScanner();
     if (!loadState().running) return;
     log('当前：我的课程页，寻找第一门未完成的课程');
     setStatus('🟢 运行中｜我的课程页');
