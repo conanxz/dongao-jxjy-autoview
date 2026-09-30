@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.2.2
+// @version      2.3.0
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.2.2';
+  const VER = '2.3.0';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
@@ -79,6 +79,11 @@
         const tag = loadState().running ? 'dop_run=1' : 'dop_paused=1';
         url += (url.indexOf('#') === -1 ? '#' : '&') + tag;
       }
+      // v2.3.0：跳转时把学分总进度带给目标域（hash 不发服务器，不触发加密Key校验）
+      const c = readJson(CREDIT_KEY, null);
+      if (c && isFinite(c.total) && c.total > 0 && url.indexOf('dop_credit=') === -1) {
+        url += (url.indexOf('#') === -1 ? '#' : '&') + 'dop_credit=' + c.total + '/' + c.earned;
+      }
     } catch (e) {}
     return url;
   }
@@ -122,6 +127,7 @@
 #dop-badge.show{display:flex}
 #dop-status{font-size:12px;color:#555;margin:4px 0;padding:4px 6px;background:#f0f7ff;border-radius:5px}
 #dop-cur{font-size:12px;color:#1677ff;margin:3px 0;font-weight:bold}
+#dop-credit{font-size:12px;color:#389e0d;margin:3px 0;font-weight:bold}
 #dop-pg{font-size:11px;color:#888;margin-bottom:4px;word-break:break-all}
 #dop-bar{height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:4px 0 6px;display:none}
 #dop-bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#1677ff,#52c41a);transition:width .6s}
@@ -139,6 +145,7 @@
   <h3>东奥自动看课 v${VER} <span id="dop-min" title="最小化">−</span></h3>
   <div id="dop-status">✅ 脚本已加载</div>
   <div id="dop-cur"></div>
+  <div id="dop-credit"></div>
   <div id="dop-pg"></div>
   <div id="dop-bar"><i></i></div>
   <div id="dop-log">等待中…</div>
@@ -167,6 +174,7 @@
 
   // 日志持久化（环形缓冲，固定 500 条防堆积）
   const LOG_KEY = 'dongao18_log';
+  const CREDIT_KEY = 'dongao18_credit';   // 学分总进度缓存 {total, earned}
   const LOG_MAX = 500;
   function addLog(m) {
     const el = document.getElementById('dop-log');
@@ -183,6 +191,19 @@
     } catch (e) {}
   }
   function setCur(t) { const el = document.getElementById('dop-cur'); if (el) el.textContent = t; }
+  function setCredit() {
+    const el = document.getElementById('dop-credit');
+    if (!el) return;
+    try {
+      const c = readJson(CREDIT_KEY, null);
+      if (c && isFinite(c.total) && c.total > 0) {
+        const pct = (c.earned / c.total * 100).toFixed(1);
+        el.textContent = '总进度：' + pct + '%（' + c.earned + ' / ' + c.total + ' 学分）';
+      } else {
+        el.textContent = '总进度：暂无（回一次「我的课程」页自动统计）';
+      }
+    } catch (e) {}
+  }
   function setPg(t) { const el = document.getElementById('dop-pg'); if (el) el.textContent = t; }
   function setBar(pct) {
     const bar = document.getElementById('dop-bar');
@@ -205,6 +226,7 @@
       btn.textContent = '▶ 开始';
       btn.classList.add('paused');
     }
+    setCredit();
   }
 
   function toggleRun() {
@@ -564,7 +586,43 @@
   }
 
   // ═══ C. 我的课程页：找第一门未完成的课（支持翻页）═══
+  // —— 学分总进度（v2.3.0）：myCourse 表格累加 总学分/已学学分 ——
+  function parseCredits() {
+    try {
+      for (const tb of document.querySelectorAll('table')) {
+        const first = tb.querySelector('tr');
+        if (!first) continue;
+        const heads = Array.from(first.querySelectorAll('th,td')).map(x => (x.textContent || '').trim());
+        const ti = heads.findIndex(h => /总学分/.test(h));
+        const ei = heads.findIndex(h => /已学学分/.test(h));
+        if (ti === -1 || ei === -1) continue;
+        let total = 0, earned = 0, rows = 0;
+        for (const tr of tb.querySelectorAll('tr')) {
+          if (tr === first) continue;
+          const tds = Array.from(tr.querySelectorAll('td'));
+          if (tds.length <= Math.max(ti, ei)) continue;
+          if (/合计|总计|小计/.test(tr.textContent || '')) continue;
+          const tv = parseFloat(((tds[ti].textContent) || '').replace(/[^\d.]/g, ''));
+          const ev = parseFloat(((tds[ei].textContent) || '').replace(/[^\d.]/g, ''));
+          if (isFinite(tv)) { total += tv; rows++; }
+          if (isFinite(ev)) earned += ev;
+        }
+        if (rows > 0 && total > 0) {
+          return { total: Math.round(total * 100) / 100, earned: Math.round(earned * 100) / 100 };
+        }
+      }
+    } catch (e) { log('学分解析异常：', e.message); }
+    return null;
+  }
+
   function onMyCourse() {
+    // v2.3.0：进我的课程页就刷新学分总进度（暂停状态也统计）
+    const cr = parseCredits();
+    if (cr) {
+      writeJson(CREDIT_KEY, cr);
+      setCredit();
+      log('📊 总进度统计：' + cr.earned + ' / ' + cr.total + ' 学分（' + (cr.earned / cr.total * 100).toFixed(1) + '%）');
+    }
     if (!loadState().running) return;
     log('当前：我的课程页，寻找第一门未完成的课程');
     setStatus('🟢 运行中｜我的课程页');
@@ -1116,6 +1174,12 @@
   function main() {
     // v2.2.0：URL 携带 dop_paused=1 时，保持暂停并清掉参数
     try {
+      // v2.3.0：接收学分总进度并缓存到本域
+      const cm = (location.hash || '').match(/dop_credit=([\d.]+)\/([\d.]+)/);
+      if (cm) {
+        const t = parseFloat(cm[1]), e = parseFloat(cm[2]);
+        if (isFinite(t) && isFinite(e) && t > 0) writeJson(CREDIT_KEY, { total: t, earned: e });
+      }
       const hm = (location.hash || '').match(/dop_paused=1|dop_run=1/);
       if (hm) {
         const st = loadState();
@@ -1124,7 +1188,7 @@
           st.running = wantRun; saveState(st);
           log(wantRun ? '▶ 跨页恢复运行（由上一页状态同步）' : '⏸ 跨页保持暂停（由上一页状态同步）');
         }
-        const h = location.hash.replace(/[#&](dop_paused=1|dop_run=1)/g, '').replace(/^#&?/, '');
+        const h = location.hash.replace(/[#&](dop_paused=1|dop_run=1|dop_credit=[\d.]+\/[\d.]+)/g, '').replace(/^#&?/, '');
         history.replaceState(null, '', location.pathname + location.search + (h ? '#' + h : ''));
       }
     } catch (e) {}
