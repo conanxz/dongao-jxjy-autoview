@@ -1,0 +1,1277 @@
+// ==UserScript==
+// @name         东奥自动看课（江西挂课版）
+// @namespace    http://tampermonkey.net/
+// @version      2.3.1-jx.1
+// @description  江西会计继续教育自动挂课版：保留自动看课、放完自动切课、黑屏自愈、答题/超时弹窗、日志导出；已阉割浙江门户链/登录识别/浙里办暂停等跳转逻辑
+// @author       conanxz
+// @match        *://*.dongao.cn/*
+// @grant        none
+// @run-at       document-start
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
+  const DEBUG = false;
+  const VER = '2.3.1-jx.1';
+  const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
+
+  // ═══ 常量 ═══
+  const STATE_KEY = 'dongao18_state';
+  const REC_KEY = 'dongao18_rec';      // 异常恢复计数（循环保护）
+  const BREAK_KEY = 'dongao18_break';  // 断点记录（诊断用）
+  const ENTRY_URL = 'https://jiangxi.dongao.cn/study/u/myCourse';
+  const INDEX_URL = 'https://jiangxi.dongao.cn/study/u/myCourse';
+  const LEARN_HOSTS = ['jiangxi.dongao.cn', 'study.dongao.cn', 'jixuweb.dongao.cn', 'jxjycwweb.dongao.cn'];
+  const MAX_REC = 6;                   // 30 分钟内异常恢复超过 6 次 → 判定登录卡死，自动暂停求助
+  const REC_WINDOW_MS = 30 * 60 * 1000;
+
+  // ═══ 通用小工具 ═══
+  function readJson(key, dflt) {
+    try { const raw = localStorage.getItem(key); if (raw) return JSON.parse(raw); } catch (e) {}
+    return dflt;
+  }
+  function writeJson(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {} }
+
+  function loadState() {
+    const s = readJson(STATE_KEY, null);
+    if (s && typeof s === 'object') { if (s.version !== VER) s.version = VER; return s; }
+    return { running: true, version: VER };
+  }
+  function saveState(s) { writeJson(STATE_KEY, s); }
+
+  function getAccount() {
+    const m = location.search.match(/accountId=(\d+)/);
+    if (m) { try { localStorage.setItem('dongao18_account', m[1]); } catch (e) {} return m[1]; }
+    try { const saved = localStorage.getItem('dongao18_account'); if (saved) return saved; } catch (e) {}
+    return '33598545';
+  }
+  function myCourseUrl() { return 'https://study.dongao.cn/study/u/myCourse?accountId=' + getAccount(); }
+
+  // ═══ 异常恢复计数（循环保护）═══
+  function recBump(where) {
+    let r = readJson(REC_KEY, null);
+    if (!r || (Date.now() - r.ts) > REC_WINDOW_MS) r = { n: 0, ts: Date.now(), log: [] };
+    r.n++;
+    r.log.push(new Date().toTimeString().slice(0, 8) + ' ' + where);
+    if (r.log.length > 12) r.log = r.log.slice(-12);
+    writeJson(REC_KEY, r);
+    return r.n;
+  }
+  function recReset() { writeJson(REC_KEY, { n: 0, ts: Date.now(), log: [] }); }
+
+  // 异常恢复：回到我的课程页继续挂课
+  // —— 跨页保持暂停（v2.2.0）：跳转 URL 带 dop_paused=1，新页读到即保持暂停 ——
+  function withPause(url) {
+    // v2.2.1：对称状态传递——跳转时把源页 running 状态带给目标页，
+    // 否则跨域 localStorage 不同步（暂停后恢复，别的域还停在旧状态）
+    // v2.2.2：改用 #hash 传状态——hash 不发给服务器，不会触发平台
+    // 「Url的加密Key有异常」校验（query 加参数会被平台签名校验拒绝）
+    try {
+      if (url.indexOf('dop_run=1') === -1 && url.indexOf('dop_paused=1') === -1) {
+        const tag = loadState().running ? 'dop_run=1' : 'dop_paused=1';
+        url += (url.indexOf('#') === -1 ? '#' : '&') + tag;
+      }
+      // v2.3.0：跳转时把学分总进度带给目标域（hash 不发服务器，不触发加密Key校验）
+      const c = readJson(CREDIT_KEY, null);
+      if (c && isFinite(c.total) && c.total > 0 && url.indexOf('dop_credit=') === -1) {
+        url += (url.indexOf('#') === -1 ? '#' : '&') + 'dop_credit=' + c.total + '/' + c.earned;
+      }
+    } catch (e) {}
+    return url;
+  }
+  function go(url) { window.location.href = withPause(url); }
+
+  function goRecover(where) {
+    const n = recBump(where);
+    if (n > MAX_REC) {
+      const s = loadState(); s.running = false; saveState(s);
+      log('⚠️ 异常恢复已连续 ' + n + ' 次（' + where + '），疑似登录卡死，已自动暂停');
+      setStatus('🔴 恢复失败已暂停，请手动登录');
+      setCur('手动登录后点「▶ 开始」继续');
+      refreshPanel();
+      return;
+    }
+    log('异常恢复(' + n + '/' + MAX_REC + ')：' + where + ' → 回我的课程页');
+    setStatus('🟡 会话异常，恢复中…');
+    go(ENTRY_URL);
+  }
+
+  function saveBreak(tag) {
+    writeJson(BREAK_KEY, { tag: tag, url: location.href, ts: Date.now(), time: new Date().toLocaleString() });
+  }
+
+  // ═══ 悬浮面板 ═══
+  function createPanel() {
+    try {
+      if (document.getElementById('dop')) return;
+      if (!document.body) { setTimeout(createPanel, 200); return; }
+      const d = document.createElement('div');
+      d.id = 'dop';
+      d.innerHTML = `
+<style>
+#dop{position:fixed;top:16px;right:16px;left:auto;width:300px;max-width:92vw;box-sizing:border-box;z-index:9999999;font-family:system-ui,-apple-system,'Microsoft YaHei',sans-serif;font-size:13px;color:#222}
+#dop-box{background:#fff;border:2px solid #1677ff;border-radius:10px;padding:10px 12px;box-shadow:0 6px 20px rgba(0,0,0,.18);min-width:250px;position:relative}
+#dop-box.min{display:none}
+#dop h3{margin:0 0 6px;font-size:14px;color:#1677ff;padding-right:24px;line-height:1.3}
+#dop-min{position:absolute;top:6px;right:8px;background:none;border:none;font-size:18px;cursor:pointer;color:#1677ff;line-height:1;padding:0 2px}
+#dop-min:hover{color:#0958d9}
+#dop-badge{position:fixed;top:16px;right:16px;z-index:9999999;width:38px;height:38px;border-radius:50%;background:#1677ff;color:#fff;display:none;align-items:center;justify-content:center;font-size:16px;cursor:pointer;box-shadow:0 2px 10px rgba(22,119,255,.4);border:none;font-weight:bold}
+#dop-badge.show{display:flex}
+#dop-status{font-size:12px;color:#555;margin:4px 0;padding:4px 6px;background:#f0f7ff;border-radius:5px}
+#dop-cur{font-size:12px;color:#1677ff;margin:3px 0;font-weight:bold}
+#dop-credit{font-size:12px;color:#389e0d;margin:3px 0;font-weight:bold}
+#dop-pg{font-size:11px;color:#888;margin-bottom:4px;word-break:break-all}
+#dop-bar{height:6px;background:#eee;border-radius:3px;overflow:hidden;margin:4px 0 6px;display:none}
+#dop-bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,#1677ff,#52c41a);transition:width .6s}
+#dop-log{background:#fafafa;border:1px solid #eee;border-radius:6px;padding:6px;margin:4px 0;max-height:160px;overflow-y:auto;font-size:11px;color:#555;white-space:pre-wrap;line-height:1.5;word-break:break-all}
+#dop-btn{width:100%;padding:7px;background:#1677ff;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:bold}
+#dop-btn:hover{opacity:.88}
+#dop-btn.paused{background:#ff4d4f}
+#dop-rst{display:block;margin-top:5px;width:100%;padding:4px;background:none;border:1px solid #ddd;border-radius:4px;cursor:pointer;font-size:11px;color:#999}
+#dop-rst:hover{border-color:#1677ff;color:#1677ff}
+#dop-exp{display:block;margin-top:4px;width:100%;padding:4px;background:#f6ffed;border:1px solid #b7eb8f;border-radius:4px;cursor:pointer;font-size:11px;color:#389e0d}
+#dop-exp:hover{border-color:#389e0d;background:#f0ffed}
+</style>
+<button id="dop-badge" title="展开面板">东</button>
+<div id="dop-box">
+  <h3>东奥自动看课 v${VER} <span id="dop-min" title="最小化">−</span></h3>
+  <div id="dop-status">✅ 脚本已加载</div>
+  <div id="dop-cur"></div>
+  <div id="dop-credit"></div>
+  <div id="dop-pg"></div>
+  <div id="dop-bar"><i></i></div>
+  <div id="dop-log">等待中…</div>
+  <button id="dop-btn">⏸ 暂停</button>
+  <button id="dop-rst">🔄 重置</button>
+  <button id="dop-exp">📋 导出日志（复制）</button>
+</div>`;
+      document.body.appendChild(d);
+      document.getElementById('dop-min').onclick = () => {
+        document.getElementById('dop-box').classList.add('min');
+        document.getElementById('dop-badge').classList.add('show');
+      };
+      document.getElementById('dop-badge').onclick = () => {
+        document.getElementById('dop-box').classList.remove('min');
+        document.getElementById('dop-badge').classList.remove('show');
+      };
+      document.getElementById('dop-btn').onclick = () => toggleRun();
+      document.getElementById('dop-rst').onclick = () => resetAll();
+      const exp = document.getElementById('dop-exp');
+      if (exp) exp.onclick = () => exportLog();
+      refreshPanel();
+    } catch (e) {
+      console.error('[东奥2.0] 面板创建失败：', e);
+    }
+  }
+
+  // 日志持久化（环形缓冲，固定 500 条防堆积）
+  const LOG_KEY = 'dongao18_log';
+  const CREDIT_KEY = 'dongao18_credit';   // 学分总进度缓存 {total, earned}
+  const LOG_MAX = 500;
+  function addLog(m) {
+    const el = document.getElementById('dop-log');
+    const now = new Date();
+    const t = now.toTimeString().slice(0, 8);
+    if (el) { el.textContent += t + ' ' + m + '\n'; el.scrollTop = el.scrollHeight; }
+    // 持久化：完整时间戳 + 消息，写当前域 localStorage 环形缓冲
+    try {
+      let arr = readJson(LOG_KEY, []);
+      if (!Array.isArray(arr)) arr = [];
+      arr.push({ t: now.toLocaleString('zh-CN', { hour12: false }), m: String(m) });
+      if (arr.length > LOG_MAX) arr = arr.slice(-LOG_MAX);
+      localStorage.setItem(LOG_KEY, JSON.stringify(arr));
+    } catch (e) {}
+  }
+  function setCur(t) { const el = document.getElementById('dop-cur'); if (el) el.textContent = t; }
+  function setCredit() {
+    const el = document.getElementById('dop-credit');
+    if (!el) return;
+    try {
+      const c = readJson(CREDIT_KEY, null);
+      if (c && isFinite(c.total) && c.total > 0) {
+        const pct = (c.earned / c.total * 100).toFixed(1);
+        el.textContent = '总进度：' + pct + '%（' + c.earned + ' / ' + c.total + ' 学分）';
+      } else {
+        el.textContent = '总进度：暂无（回一次「我的课程」页自动统计）';
+      }
+    } catch (e) {}
+  }
+  function setPg(t) { const el = document.getElementById('dop-pg'); if (el) el.textContent = t; }
+  function setBar(pct) {
+    const bar = document.getElementById('dop-bar');
+    const i = bar ? bar.querySelector('i') : null;
+    if (!bar || !i) return;
+    if (pct == null) { bar.style.display = 'none'; return; }
+    bar.style.display = 'block';
+    i.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  }
+  function setStatus(t) { const el = document.getElementById('dop-status'); if (el) el.textContent = t; }
+
+  function refreshPanel() {
+    const s = loadState();
+    const btn = document.getElementById('dop-btn');
+    if (!btn) return;
+    if (s.running) {
+      btn.textContent = '⏸ 暂停';
+      btn.classList.remove('paused');
+    } else {
+      btn.textContent = '▶ 开始';
+      btn.classList.add('paused');
+    }
+    setCredit();
+  }
+
+  function toggleRun() {
+    const s = loadState();
+    s.running = !s.running;
+    saveState(s);
+    refreshPanel();
+    if (s.running) {
+      addLog('▶ 已启动/恢复自动学习');
+      setStatus('🟢 运行中');
+      recReset();
+      main();
+    } else {
+      addLog('⏸ 已暂停（当前页停止自动操作）');
+      setStatus('🔴 已暂停');
+    }
+  }
+
+  function resetAll() {
+    if (!confirm('确认重置自动学习状态？（清空断点/恢复计数，回到学习首页重新开始）')) return;
+    try {
+      localStorage.removeItem(STATE_KEY);
+      localStorage.removeItem(REC_KEY);
+      localStorage.removeItem(BREAK_KEY);
+      sessionStorage.removeItem('dongao_lecture_list');
+      sessionStorage.removeItem('dop_fail_cnt');
+    } catch (e) {}
+    addLog('状态已重置，走门户链重新进入学习');
+    setCur(''); setPg(''); setBar(null); refreshPanel();
+    setTimeout(() => startPortalEntry(), 800);
+  }
+
+  function exportLog() {
+    try {
+      const arr = readJson(LOG_KEY, []);
+      const lines = [];
+      lines.push('东奥自动看课 v' + VER + ' 运行日志');
+      lines.push('时间: ' + new Date().toLocaleString('zh-CN', { hour12: false }));
+      lines.push('页面: ' + location.href);
+      lines.push('UA: ' + (navigator.userAgent || '').slice(0, 120));
+      const s = loadState();
+      lines.push('状态: ' + JSON.stringify(s));
+      lines.push('账户: ' + (getAccount() || '未识别'));
+      const stage = readJson('dongao18_stage', '');
+      if (stage) lines.push('阶段: ' + stage);
+      lines.push('日志条数: ' + (Array.isArray(arr) ? arr.length : 0));
+      lines.push('────────────────────────────');
+      if (Array.isArray(arr) && arr.length) {
+        arr.forEach(x => lines.push('[' + (x.t || '?') + '] ' + (x.m || '')));
+      } else {
+        lines.push('（本页面尚无日志记录）');
+      }
+      const text = lines.join('\n');
+      // 复制到剪贴板（优先 Clipboard API，失败用 execCommand 兜底）
+      function fallback() {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed'; ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          addLog('📋 日志已复制到剪贴板（' + arr.length + ' 条）');
+        }).catch(() => { fallback(); addLog('📋 日志已复制（降级）'); });
+      } else { fallback(); addLog('📋 日志已复制到剪贴板'); }
+    } catch (e) {
+      console.error('[东奥2.0] 导出日志失败：', e);
+      addLog('⚠️ 导出日志失败：' + e.message);
+    }
+  }
+
+  function log(...a) {
+    const msg = a.map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+    console.log('[东奥2.0]', ...a);
+    addLog(msg);
+  }
+
+  // 防当前页重复初始化
+  if (window.__dongao18) {
+    console.log('[东奥2.0] 本页已初始化，跳过');
+    return;
+  }
+  window.__dongao18 = true;
+
+  // ═══════════════════════════════════════════════════
+  // 单标签强制（v2.0 核心修复②：根治多开）
+  // 说明：`<a target="_blank">`、表单 target、鼠标中键/修饰键点击都不走 window.open，
+  //       仅劫持 window.open 拦不住 → 必须叠加“点击捕获拦截 + target 属性剥离”双保险。
+  // ═══════════════════════════════════════════════════
+  (function enforceSingleTab() {
+    // 1) window.open 全部改同标签（http(s) 跳本页；其它一律吞掉，不开新窗）
+    const _origOpen = window.open;
+    window.open = function (url) {
+      // v2.0.2：支持相对路径（讲次点击常用 window.open('/xxx/videoPlay?...')，相对地址要基于当前页解析成绝对地址）
+      if (typeof url === 'string' && url) {
+        let abs = null;
+        try { abs = new URL(url, location.href).href; } catch (e) { abs = null; }
+        if (abs && /^https?:/i.test(abs)) {
+          log('拦截 window.open → 同标签跳转:', abs);
+          go(abs);
+          return null;
+        }
+      }
+      log('拦截 window.open（非链接调用，已吞掉防多开）', url);
+      return null;
+    };
+    void _origOpen;
+
+    // 2) 点击捕获阶段拦截：target!=_self、ctrl/shift/中键点击 → 同标签
+    function sameTabify(a) {
+      try {
+        const href = a.getAttribute('href');
+        if (!href || href === '#' || /^\s*javascript:/i.test(href)) return false;
+        const url = new URL(href, location.href);
+        if (!/^https?:/i.test(url.protocol)) return false;
+        log('拦截新标签点击 → 同标签跳转:', url.href);
+        go(url.href);
+        return true;
+      } catch (e) { return false; }
+    }
+    function onClick(e) {
+      try {
+        const a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        if (!a) return;
+        const t = (a.getAttribute('target') || '').toLowerCase();
+        const newTabByMod = e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1;
+        if ((t && t !== '_self') || newTabByMod) {
+          e.preventDefault();
+          e.stopPropagation();
+          sameTabify(a);
+        }
+      } catch (err) {}
+    }
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('auxclick', onClick, true); // 鼠标中键
+
+    // 3) 兜底：DOM 里出现 target 就剥掉（覆盖 JS 动态插的链接、表单、键盘触发）
+    function killTargets(root) {
+      try {
+        if (!root) return;
+        if (root.nodeType === 1 && root.matches && root.matches('a[target],area[target],form[target],base[target]')) {
+          root.removeAttribute('target');
+        }
+        if (root.querySelectorAll) {
+          root.querySelectorAll('a[target],area[target],form[target],base[target]').forEach(el => el.removeAttribute('target'));
+        }
+      } catch (e) {}
+    }
+    try {
+      const mo = new MutationObserver(muts => {
+        for (const m of muts) {
+          if (m.type === 'attributes') { killTargets(m.target); }
+          else { m.addedNodes && m.addedNodes.forEach(killTargets); }
+        }
+      });
+      mo.observe(document.documentElement || document, {
+        childList: true, subtree: true, attributes: true, attributeFilter: ['target']
+      });
+      killTargets(document.documentElement || document);
+    } catch (e) {}
+  })();
+
+  // ═══ 文本查找/点击 ═══
+  function matchText(els, texts) {
+    for (const t of texts) {
+      const el = els.find(e => {
+        const tx = (e.textContent || e.value || e.getAttribute('title') || '').trim();
+        return tx === t || tx.indexOf(t) !== -1;
+      });
+      if (el) return el;
+    }
+    return null;
+  }
+  function findByText(texts, root) {
+    root = root || document;
+    const sel1 = 'a,button,input,select,textarea,[role=button],.btn,.button,.el-button,li[onclick]';
+    let el = matchText(Array.from(root.querySelectorAll(sel1)), texts);
+    if (el) return el;
+    const sel2 = 'span[onclick],div[onclick],span.clickable,div.clickable';
+    return matchText(Array.from(root.querySelectorAll(sel2)), texts);
+  }
+  function clickByText(texts, root) {
+    const el = findByText(texts, root);
+    if (el) { log('点击：', (el.textContent || el.value || texts[0]).trim()); el.click(); return true; }
+    return false;
+  }
+
+  // ═══════════════════════════════════════════════════
+  // A. 浙江门户入口：登录态识别（v2.0 核心修复①）
+  //   规则（按泳杰酱需求）：
+  //   - 识别登录状态；未登录 → 先尝试点「登录」免验证直登，不行就静静等待手动登录
+  //   - 只有【确认已登录】才跳 https://study.dongao.cn/study/index/index
+  //   - 旧版盲等 5 秒就跳是死循环根源：没登上 → 被踢 guangdong → 又回入口 → 再跳…
+  // ═══════════════════════════════════════════════════
+  function jxjyProbe() {
+    if (!document.body) return 'loading';
+    // 首选硬信号：页面隐藏域 input#isLogin（2026-09-24 实测：'1'=已登录，页面同时有“退出登录”和用户名）
+    const flag = document.getElementById('isLogin');
+    if (flag) {
+      const v = (flag.value || '').trim();
+      if (v === '1') return 'in';
+      if (v === '0') return 'out';
+    }
+    // 兜底：文字启发式
+    const txt = document.body.innerText || '';
+    const hasLogout = /退出登录|个人中心|我的学习/.test(txt);
+    const loginEl = findByText(['登录', '登入', '登陆'], document);
+    if (hasLogout) return 'in';
+    if (loginEl) return 'out';
+    return 'unknown';
+  }
+
+  function onJxjyEntry() {
+    if (!loadState().running) return;
+    if (window.__dop_jxjy) return;
+    window.__dop_jxjy = true;
+    setStatus('🟡 浙江门户入口｜登录态检测中…');
+    let clicked = 0, probes = 0;
+    const step = () => {
+      if (!loadState().running) { setStatus('🔴 已暂停'); return; }
+      const st = jxjyProbe();
+      setCur('登录状态：' + ({ in: '✅ 已登录', out: '❌ 未登录', unknown: '🔍 检测中', loading: '⏳ 页面加载中' })[st]);
+
+      if (st === 'in') {
+        // v2.0.6：不再裸跳 study 首页（冷访问会因浙江 study 会话过期被重定向到 hlj.dongao.cn 等区域落地页），
+        // 改走门户官方链 golearncenter → 选学校 → 东奥「继续学习」，重建浙江学习会话后自然进入学习
+        log('✅ 识别到已登录，走门户链重建学习会话');
+        setStatus('🟢 已登录，进入学习…');
+        startPortalEntry();
+        return;
+      }
+
+      if (st === 'out') {
+        if (clicked < 2) {
+          clicked++;
+          log('未登录，尝试点「登录」免验证直登（' + clicked + '/2）');
+          setStatus('🟡 未登录，尝试免验证登录…');
+          if (clickByText(['登录', '登入', '登陆'])) { setTimeout(step, 2500); return; }
+        }
+        probes++;
+        if (probes === 20) log('仍未登录，开始等待手动登录（页面持续检测，登上后自动跳转）');
+        setStatus('⏳ 等待登录（可手动完成登录）');
+        setTimeout(step, 3000);
+        return;
+      }
+
+      // unknown / loading：多探几次，别被“按钮还没渲染”误判
+      probes++;
+      if (probes <= 20) { setTimeout(step, 1500); return; }
+      log('登录态持续无法识别（探测30秒），放行到学习首页，由那边兜底裁决');
+      go(INDEX_URL);
+    };
+    log('当前：浙江门户入口，开始识别登录状态');
+    step();
+  }
+
+  // v2.0.6：门户链重建学习会话（替代裸跳 study 首页，防被重定向到 hlj 等区域页）
+  function currentYear() { try { return String(new Date().getFullYear()); } catch (e) { return '2026'; } }
+  function setStage(s) { writeJson('dongao18_stage', s); }
+  function clrStage() { try { localStorage.removeItem('dongao18_stage'); } catch (e) {} }
+  function startPortalEntry() {
+    // 江西版：门户链已阉割，直接回我的课程页继续自动挂课
+    log('走恢复链：回江西我的课程页');
+    go(ENTRY_URL);
+  }
+
+  function onZjPortal() {
+    if (!loadState().running) return;
+    const u = location.href;
+    if (u.indexOf('/front/jxjy.html') !== -1) { onJxjyEntry(); return; }
+
+    // 网络继续教育学习页：点当年「继续学习」进选学校
+    if (u.indexOf('golearncenterNew') !== -1) {
+      setStatus('🟢 门户链｜继续教育学习页');
+      let n = 0;
+      const go = () => {
+        if (!loadState().running) return;
+        const a = Array.from(document.querySelectorAll('a[href*="goSelectSchoolNew"]')).find(
+          x => { const t = (x.textContent || '').trim(); return t === '继续学习' || t.indexOf('继续学习') !== -1; }) || null;
+        if (a) { setStage('select'); log('点击「继续学习」进入选学校'); a.click(); return; }
+        if (++n <= 12) { setTimeout(go, 1500); return; }
+        log('未找到「继续学习」链接，直接进选学校页');
+        setStage('select');
+        go('https://jxjy.czt.zj.gov.cn/front/goSelectSchoolNew.html?syear=' + currentYear());
+      };
+      go();
+      return;
+    }
+
+    // 选学校页：点东奥「继续学习」（onclick=gonetschool(...)）
+    if (u.indexOf('goSelectSchoolNew') !== -1) {
+      setStatus('🟢 门户链｜选学校页');
+      let n = 0;
+      const go = () => {
+        if (!loadState().running) return;
+        const all = Array.from(document.querySelectorAll('a,button,span[onclick],div[onclick]'));
+        let el = all.find(x => (x.getAttribute('onclick') || '').indexOf('gonetschool') !== -1) || null;
+        if (!el) el = all.find(x => (x.textContent || '').trim() === '继续学习') || null;
+        if (el) { clrStage(); log('点击东奥「继续学习」进入学习（重建会话）'); el.click(); return; }
+        if (++n <= 12) { setTimeout(go, 1500); return; }
+        clrStage();
+        log('选学校页未找到「继续学习」，退回学习首页');
+        go(INDEX_URL);
+      };
+      go();
+      return;
+    }
+
+    // 门户其它子页：走学习链重建
+    log('处于门户子页，走学习链重建会话');
+    startPortalEntry();
+  }
+
+  // ═══ B. 学习首页：点「去学习」 ═══
+  function onIndex() {
+    if (!loadState().running) return;
+    log('当前：学习首页，自动点击「去学习」进入学习列表');
+    setStatus('🟢 运行中｜学习首页');
+    let n = 0;
+    const go = () => {
+      if (!loadState().running) { setStatus('🔴 已暂停'); return; }
+      let el = document.querySelector('a[href*="/study/u/myCourse"]');
+      if (!el) {
+        const all = Array.from(document.querySelectorAll('a,button'));
+        el = all.find(x => { const t = (x.textContent || '').trim(); return t === '去学习' || t.indexOf('去学习') !== -1; }) || null;
+      }
+      if (el) {
+        log('点击「去学习」进入学习列表：', (el.getAttribute('href') || el.textContent.trim()));
+        setCur('正在进入学习列表…');
+        el.click();
+      } else if (++n <= 20) {
+        log('未找到「去学习」入口，1.5s 后重试(' + n + '/20)');
+        setTimeout(go, 1500);
+      } else {
+        log('未找到「去学习」入口，直接尝试课程列表地址兜底');
+        go(myCourseUrl());
+      }
+    };
+    go();
+  }
+
+  // ═══ 列表翻页小工具（课程列表/讲次列表通用）═══
+  function findNextPage() {
+    const els = Array.from(document.querySelectorAll('a,button,li'));
+    for (const el of els) {
+      const t = (el.textContent || '').trim();
+      if (t !== '下一页' && t !== '下页' && t !== '>' && t !== '»' && t !== '›') continue;
+      if (el.disabled) continue;
+      if (el.closest && el.closest('.disabled, .disabled a, [disabled]')) continue;
+      if (el.tagName === 'LI') { const a = el.querySelector('a'); return a || el; }
+      return el;
+    }
+    return document.querySelector('a.next, .pagination .next a, li.next > a') || null;
+  }
+
+  // ═══ C. 我的课程页：找第一门未完成的课（支持翻页）═══
+  // —— 学分总进度（v2.3.0）：myCourse 表格累加 总学分/已学学分 ——
+  function parseCredits() {
+    try {
+      for (const tb of document.querySelectorAll('table')) {
+        const first = tb.querySelector('tr');
+        if (!first) continue;
+        const heads = Array.from(first.querySelectorAll('th,td')).map(x => (x.textContent || '').trim());
+        const ti = heads.findIndex(h => /总学分/.test(h));
+        const ei = heads.findIndex(h => /已学学分/.test(h));
+        if (ti === -1 || ei === -1) continue;
+        let total = 0, earned = 0, rows = 0;
+        for (const tr of tb.querySelectorAll('tr')) {
+          if (tr === first) continue;
+          const tds = Array.from(tr.querySelectorAll('td'));
+          if (tds.length <= Math.max(ti, ei)) continue;
+          if (/合计|总计|小计/.test(tr.textContent || '')) continue;
+          const tv = parseFloat(((tds[ti].textContent) || '').replace(/[^\d.]/g, ''));
+          const ev = parseFloat(((tds[ei].textContent) || '').replace(/[^\d.]/g, ''));
+          if (isFinite(tv)) { total += tv; rows++; }
+          if (isFinite(ev)) earned += ev;
+        }
+        if (rows > 0 && total > 0) {
+          return { total: Math.round(total * 100) / 100, earned: Math.round(earned * 100) / 100 };
+        }
+      }
+    } catch (e) { log('学分解析异常：', e.message); }
+    return null;
+  }
+
+  // v2.3.1：学分表格可能异步渲染，退避重试直到解析成功
+  let creditGen = 0;
+  function startCreditScanner() {
+    const gen = ++creditGen;
+    let n = 0;
+    const tryOnce = () => {
+      if (gen !== creditGen) return;
+      n++;
+      const cr = parseCredits();
+      if (cr) {
+        writeJson(CREDIT_KEY, cr);
+        setCredit();
+        log('📊 总进度统计：' + cr.earned + ' / ' + cr.total + ' 学分（' + (cr.earned / cr.total * 100).toFixed(1) + '%）');
+        return;
+      }
+      if (n <= 8) {
+        if (n === 1) log('学分表格未就绪，稍后重试…');
+        setTimeout(tryOnce, 500 * n);
+      } else {
+        const nT = document.querySelectorAll('table').length;
+        log('⚠️ 学分统计失败：重试' + (n - 1) + '次未取到数据（页面table数=' + nT + '）');
+      }
+    };
+    tryOnce();
+  }
+
+  function onMyCourse() {
+    // v2.3.0：进我的课程页就刷新学分总进度（暂停状态也统计）
+    startCreditScanner();
+    if (!loadState().running) return;
+    log('当前：我的课程页，寻找第一门未完成的课程');
+    setStatus('🟢 运行中｜我的课程页');
+    let retries = 0, pages = 0;
+    const pick = () => {
+      if (!loadState().running) { setStatus('🔴 已暂停'); return; }
+      const btns = Array.from(document.querySelectorAll('a.operate-a'));
+      if (btns.length) {
+        recReset(); // 列表渲染成功 = 登录态健康，清异常恢复计数
+        retries = 0;
+      }
+      let target = null;
+      for (const b of btns) {
+        const t = (b.textContent || '').trim();
+        // 已完成课程按钮是「重新学习」，跳过；要学的是「开始学习 / 继续学习」
+        if (t === '开始学习' || t === '继续学习') { target = b; break; }
+      }
+      if (target) {
+        const title = target.closest('tr') ? target.closest('tr').innerText.replace(/\s+/g, ' ').slice(0, 60) : target.textContent.trim();
+        log('进入课程：', title);
+        saveBreak('进入课程:' + title);
+        setCur('课程：' + title);
+        setPg('');
+        target.click();
+        return;
+      }
+      // 当前页没有可学的 → 试试翻页
+      const next = findNextPage();
+      if (next && pages < 10) {
+        pages++;
+        log('本页无可学课程，翻到下一页(' + pages + ')');
+        setPg('已翻 ' + pages + ' 页继续找…');
+        next.click();
+        setTimeout(pick, 2000);
+        return;
+      }
+      if (++retries <= 20 && !btns.length) {
+        log('课程表格未渲染，1.5s 后重试(' + retries + '/20)');
+        setTimeout(pick, 1500);
+        return;
+      }
+      log('没有可学习的课程了，全部已完成 ✅');
+      setStatus('✅ 全部课程已完成');
+    };
+    pick();
+  }
+
+  // ═══ D. 课程目录页：找第一讲未学完的（支持翻页）═══
+  function onLectureList() {
+    if (!loadState().running) return;
+    try { sessionStorage.setItem('dongao_lecture_list', location.href); } catch (e) {}
+    log('当前：课程目录页，寻找第一讲未学完的');
+    setStatus('🟢 运行中｜课程目录页');
+    setBar(null);
+    let retries = 0, pages = 0;
+    const pick = () => {
+      if (!loadState().running) { setStatus('🔴 已暂停'); return; }
+      const rows = Array.from(document.querySelectorAll('table.all tbody tr'));
+      let target = null, targetTitle = '', doneCount = 0;
+      for (const tr of rows) {
+        const done = tr.querySelector('span.learn-do');
+        const all = tr.querySelector('span.learn-all');
+        const studied = done ? done.textContent.trim() : '';
+        const total = all ? all.textContent.replace('/', '').trim() : '';
+        const btn = tr.querySelector('a.study-a');
+        if (!btn) continue;
+        if (studied && total && studied === total) { doneCount++; continue; }
+        target = btn;
+        const tl = tr.querySelector('.text-left a');
+        targetTitle = tl ? tl.textContent.trim() : '';
+        break;
+      }
+      if (target) {
+        // v2.0.3 防重入：刚学完但平台未确认完成的同一讲，不再重进（避免 99% 死循环）
+        const rd = readJson('dongao18_recentDone', null);
+        if (rd && (Date.now() - (rd.ts || 0)) < 5 * 60 * 1000) {
+          const hh = (target.getAttribute('href') || '') + ' ' + targetTitle;
+          const mm = hh.match(/lecture(ID|id)=(\d+)/);
+          if (mm && String(mm[2]) === String(rd.lec)) {
+            log('同一讲刚学完但平台未确认完成，视为已完成，返回课程列表换下一门（防死循环）');
+            setStatus('✅ 该讲已学完（防重入），返回课程列表');
+            saveBreak('防重入跳过讲次:' + targetTitle);
+            go(myCourseUrl());
+            return;
+          }
+        }
+        log('进入：', targetTitle || '（某讲）');
+        saveBreak('进入讲次:' + targetTitle);
+        setCur('讲次：' + targetTitle);
+        setPg('已学 ' + doneCount + ' 讲，正在进入下一讲');
+        target.click();
+        return;
+      }
+      const next = findNextPage();
+      if (next && pages < 10) {
+        pages++;
+        log('本页讲次已学完，翻到下一页(' + pages + ')');
+        next.click();
+        setTimeout(pick, 2000);
+        return;
+      }
+      if (++retries <= 20 && !rows.length) {
+        log('目录表格未就绪，1.5s 后重试(' + retries + '/20)');
+        setTimeout(pick, 1500);
+        return;
+      }
+      log('本课程所有讲已学完，返回我的课程');
+      setStatus('✅ 本课程已完成，返回课程列表');
+      go(myCourseUrl());
+    };
+    pick();
+  }
+
+  // ═══ E. 视频播放页：答题 + 放完检测 + 看门狗 + 会话保活 ═══
+  let quizGen = 0;            // 答题循环代际（重入时作废旧循环）
+  let popupGen = 0;           // 超时弹窗看门狗代际
+  let keepAliveTimer = null;
+  let videoLoopsStarted = false;
+
+  function onVideoPage() {
+    if (!loadState().running) return;
+    // 进入的是新讲次（非刚学完那讲）→ 清防重入标记
+    try {
+      const _m = location.href.match(/lecture(ID|id)=(\d+)/);
+      if (_m) {
+        const _rd = readJson('dongao18_recentDone', null);
+        if (_rd && String(_rd.lec) !== String(_m[2])) writeJson('dongao18_recentDone', null);
+      }
+    } catch (e) {}
+    log('当前：视频播放页，启动答题监听 + 放完检测 + 看门狗');
+    setStatus('🟢 运行中｜视频播放页');
+    saveBreak('视频页');
+    startQuizWatcher();
+    startTimeoutPopupWatcher();
+    startKeepAlive();
+    if (!videoLoopsStarted) {
+      videoLoopsStarted = true;
+      setupEndDetector();
+      startVideoWatchdog();
+    }
+  }
+
+  // —— 答题（v2.0 加固：任何分支都续跑，.box-sure 缺失不炸环）——
+  function startQuizWatcher() {
+    const gen = ++quizGen;
+    detect();
+    function schedule() { setTimeout(detect, 5000); }
+    function detect() {
+      if (gen !== quizGen) return;         // 已被新循环接管
+      if (!loadState().running) { schedule(); return; } // 暂停≠死掉，恢复后自动续跑
+      try {
+        if (document.querySelector('.lister_pop_box')) Checkanswer();
+        else schedule();
+      } catch (e) {
+        log('答题检测异常：', e.message);
+        schedule();
+      }
+    }
+    function Checkanswer() {
+      console.log('Checkanswer功能调用成功');
+      let answered = false;
+      try {
+        const ansEl = document.querySelector('.pop-right-ans');
+        const answers = ((ansEl && ansEl.getAttribute('value')) || '').split('');
+        const CheckList1 = document.querySelectorAll('.sub_radio_bg');
+        const CheckList2 = document.querySelectorAll('.sub_seclet_bg');
+        const list = CheckList1.length ? CheckList1 : (CheckList2.length ? CheckList2 : null);
+        if (list && answers.length) {
+          log(list === CheckList1 ? '检测到答题框，自动作答（单选）' : '检测到答题框，自动作答（多选）');
+          for (let i = 0; i < list.length; i++) {
+            for (let j = 0; j < answers.length; j++) {
+              if (list[i].getAttribute('value') === answers[j]) {
+                list[i].click();
+                console.log('点击' + list[i].getAttribute('value'));
+              }
+            }
+          }
+          answered = true;
+        }
+      } catch (e) {
+        log('未提取到答案：', e.message);
+      }
+      // 无论是否提取到答案，都点「确定」推进弹窗（500ms 让选项先落状态）
+      setTimeout(() => {
+        try {
+          const sure = document.querySelector('.box-sure');
+          if (sure) { sure.click(); log(answered ? '已作答并提交 ✔' : '未提取到答案，已直接点确定 ✔'); }
+          else log('未找到「确定」按钮，跳过');
+        } catch (e) { log('点确定异常：', e.message); }
+        schedule();
+      }, 500);
+    }
+  }
+
+  // —— 超时弹窗看门狗（v2.1.1：「听课页面已超时」→自动点「退出听课」）——
+  function startTimeoutPopupWatcher() {
+    const gen = ++popupGen;
+    detect();
+    function schedule() { setTimeout(detect, 3000); }
+    function detect() {
+      if (gen !== popupGen) return;
+      if (!loadState().running) { schedule(); return; }
+      try {
+        if (!findTimeoutPopup(document)) {
+          const frames = document.querySelectorAll('iframe');
+          for (const f of frames) {
+            try { const d = f.contentDocument; if (d && findTimeoutPopup(d)) break; } catch (e) {}
+          }
+        }
+      } catch (e) {
+        log('超时弹窗检测异常：', e.message);
+      }
+      schedule();
+    }
+    function findTimeoutPopup(root) {
+      const marker = [...root.querySelectorAll('div,span,p,h3,h4')].find(el => {
+        const t = (el.textContent || '').trim();
+        return t && t.length < 60 && /听课页面已超时|已超时[，,]?\s*请重新进入/.test(t);
+      });
+      if (!marker) return false;
+      // 实测：点「退出听课」会直接关闭网页。
+      // 正确做法：不点任何按钮，直接走恢复链回我的课程页重进。
+      log('⚠️ 检测到听课超时弹窗（不点退出，直接走恢复链重进）');
+      setTimeout(() => goRecover('听课超时'), 500);
+      return true;
+    }
+  }
+
+  // —— 视频查找/播放辅助 ——
+  function findVideo() {
+    const all = Array.from(document.querySelectorAll('video'));
+    if (!all.length) return null;
+    let best = null, bestScore = -1;
+    for (const v of all) {
+      let score = v.readyState; // 0~4
+      try { if (isFinite(v.duration) && v.duration > 0) score += 10; } catch (e) {}
+      try { if (!v.paused) score += 5; } catch (e) {}
+      if (score > bestScore) { bestScore = score; best = v; }
+    }
+    return best;
+  }
+  function nudgePlay(video) {
+    // 优先驱动 video.js 播放器实例，让 UI 状态同步（否则媒体在播、界面却停在"黑屏+播放按钮"）
+    try {
+      const vj = document.querySelector('.video-js');
+      const player = vj && (vj.player || (window.videojs && window.videojs.getPlayer && window.videojs.getPlayer(vj.id)));
+      if (player && typeof player.play === 'function') {
+        player.play();
+        try { if (typeof player.muted === 'function') player.muted(true); } catch (e2) {}
+      }
+    } catch (e) {}
+    try { const p = video.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+    try {
+      const btn = document.querySelector('.vjs-big-play-button');
+      if (btn) btn.click();
+    } catch (e) {}
+  }
+
+  // v2.0.7：黑屏自愈——video 无数据（readyState<2 / 元数据未就绪）时，分步升级触发手段，
+  // 主动重新拉起 hls 拉流，替代“只 play() 无效 + 傻等 90s 死循环刷新”。
+  // 触发手段从弱到强：① 重新绑定 hls 源(player.src) ② video.load() 强刷 ③ 点大播放按钮。
+  let _bsTries = 0; // 本轮黑屏已尝试次数（有数据后归零）
+  // v2.0.9：真实黑屏状态快照，写进 localStorage 历史日志（不被外部探查掩盖）
+  function snapBlack(video, tag) {
+    const rec = {
+      ts: Date.now(), t: new Date().toTimeString().slice(0, 8), tag,
+      readyState: video ? video.readyState : null,
+      networkState: video ? video.networkState : null,
+      errorCode: video && video.error ? video.error.code : null,
+      errorMsg: video && video.error ? String(video.error.message).slice(0, 80) : '',
+      dur: video && isFinite(video.duration) ? Math.round(video.duration) : null,
+      cur: video ? Math.round(video.currentTime) : null,
+      paused: video ? video.paused : null,
+      muted: video ? video.muted : null,
+      preload: video ? video.preload : null,
+      src: (video && video.currentSrc || '').slice(0, 50),
+      hasEME: !!(window.navigator && navigator.requestMediaKeySystemAccess)
+    };
+    try {
+      let arr = []; try { arr = JSON.parse(localStorage.getItem('dop_blacklog') || '[]'); } catch (e) {}
+      arr.push(rec); if (arr.length > 30) arr = arr.slice(-30);
+      localStorage.setItem('dop_blacklog', JSON.stringify(arr));
+    } catch (e) {}
+    return rec;
+  }
+  function healBlackScreen(video) {
+    _bsTries++;
+    snapBlack(video, 'heal' + _bsTries);
+    const step = _bsTries;
+    if (step === 1) {
+      // 尝试1：快速重绑源+点播放（不刷新，尽量保住当前播放上下文）
+      log('黑屏自愈(1)：重绑播放源…');
+      try {
+        const vj = document.querySelector('.video-js');
+        const player = vj && (vj.player || (window.videojs && window.videojs.getPlayer && window.videojs.getPlayer(vj.id)));
+        if (player) {
+          if (typeof player.muted === 'function') player.muted(true);
+          if (typeof player.play === 'function') player.play();
+          const src = (typeof player.currentSrc === 'function' ? player.currentSrc() : '') || (video && video.currentSrc) || '';
+          if (src && typeof player.src === 'function') { player.src(src); player.play(); }
+        }
+      } catch (e) {}
+      try { const btn = document.querySelector('.vjs-big-play-button'); if (btn) btn.click(); } catch (e3) {}
+      return;
+    }
+    // 尝试2+：重绑源无效（hls.js 拉流引擎已死，重设 src 不重建）→ 刷新页面重建播放器/拉流（实测有效）
+    log('黑屏自愈(' + step + ')：重绑源无效，刷新页面重建…');
+    // 防死循环：同一讲次连续刷新 3 次仍黑屏 → 判定该视频源持续故障，暂停求助
+    let rc = { lec: '', n: 0 };
+    try { rc = JSON.parse(localStorage.getItem('dop_bs_reloads') || '{"lec":"","n":0}'); } catch (e) { rc = { lec: '', n: 0 }; }
+    const m = location.href.match(/lecture(ID|id)=(\d+)/);
+    const lec = m ? m[2] : '';
+    if (rc.lec !== lec) { rc = { lec: lec, n: 1 }; } else { rc.n++; }
+    try { localStorage.setItem('dop_bs_reloads', JSON.stringify(rc)); } catch (e) {}
+    if (rc.n >= 3) {
+      // 同一讲次连续刷新 3 次仍黑屏 = 视频源持续故障 → 跳过本讲次，去下一个（自动推进不卡死）
+      log('⚠️ 该讲次连续 ' + rc.n + ' 次刷新仍黑屏，视频源故障，跳过本讲次');
+      setStatus('🟠 视频源故障，跳过本讲次');
+      try { sessionStorage.removeItem('dop_fail_cnt'); } catch (e) {}
+      try { localStorage.removeItem('dop_bs_reloads'); } catch (e) {}
+      setTimeout(goBackToLecture, 500); // 回课程列表/我的课程，自动去下一个未学讲次
+      return;
+    }
+    setTimeout(function () { location.reload(); }, 800);
+  }
+
+  // v2.0.4：媒体在播但播放器 UI 仍停在暂停态（vjs-paused）时，同步回 playing，消除"黑屏假象"
+  let _syncLogged = false;
+  function syncPlayerUI(video) {
+    try {
+      const vj = document.querySelector('.video-js');
+      if (!vj) return;
+      const paused = vj.className.indexOf('vjs-paused') !== -1;
+      if (!paused) return;
+      // v2.0.7：仅当媒体确有好数据可播（readyState>=2）才同步 UI；
+      // readyState<2 = 真黑屏无数据，play() 对 MSE 无效，交由黑屏自愈 healBlackScreen 处理，不再误报“已同步”
+      if (!(video && video.readyState >= 2)) return;
+      const player = vj.player || (window.videojs && window.videojs.getPlayer && window.videojs.getPlayer(vj.id));
+      if (player && typeof player.play === 'function') player.play();
+      const btn = document.querySelector('.vjs-big-play-button');
+      if (btn) btn.click();
+      if (!_syncLogged) { _syncLogged = true; log('已同步播放器 UI（媒体在播但界面停在暂停，已恢复播放显示）'); }
+    } catch (e) {}
+  }
+
+  // —— 放完检测 + 进度可视化 ——
+  function setupEndDetector() {
+    let bound = false, finished = false;
+    const t0 = Date.now();
+
+    const bind = (video) => {
+      if (bound) return;
+      bound = true;
+      let durLogged = false; // v2.0.2：绑定瞬间元数据可能未就绪，等首次拿到时长再补一条真实时长
+      let nearEndSince = null; // v2.0.3：末尾兜底（ended 未触发时用）
+      try { sessionStorage.removeItem('dop_fail_cnt'); } catch (e) {}
+      nudgePlay(video);
+      syncPlayerUI(video);
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (!loadState().running) { setStatus('🔴 已暂停，不自动切课'); return; }
+        if (BLACKFIX) {
+          // v2.0.9 黑屏修复模式：学完不切课，停留当前视频专注诊断黑屏
+          log('🔧 黑屏修复模式：本节已看完，不切课，停留当前视频（等待手动重置）');
+          setStatus('🔧 修复模式：已看完，不切课');
+          return;
+        }
+        markDone();
+        log('本节播放结束，等待 3 秒让进度落库后返回目录');
+        setStatus('🟢 本节完成，返回目录…');
+        setTimeout(goBackToLecture, 3000);
+      };
+      video.addEventListener('ended', finish, { once: true });
+      try {
+        if (window.videojs) {
+          document.querySelectorAll('.video-js').forEach(pe => {
+            const player = pe.player;
+            if (player && player.on) player.on('ended', finish);
+          });
+        }
+      } catch (e) {}
+      const dur = (isFinite(video.duration) && video.duration > 0) ? Math.round(video.duration) + ' 秒' : '（元数据加载中）';
+      log('video 已绑定，时长', dur);
+      recReset(); // 播放器出流成功 = 会话健康
+      if (DEBUG) { log('[DEBUG] 3 秒后模拟学完'); setTimeout(finish, 3000); }
+
+      setInterval(() => {
+        if (!loadState().running || finished) return;
+        const v = findVideo();
+        if (!v) return;
+        if (v.paused) nudgePlay(v); // 媒体掉了就拉起来
+        syncPlayerUI(v); // 媒体在播但播放器 UI 停在暂停时同步（去黑屏假象）
+        let pct = 0, hasDur = false;
+        if (isFinite(v.duration) && v.duration > 0) {
+          hasDur = true;
+          pct = (v.currentTime / v.duration) * 100;
+          if (!durLogged) { durLogged = true; log('video 时长已就绪：' + Math.round(v.duration) + ' 秒'); }
+        } else {
+          const pp = document.querySelector('.vjs-play-progress');
+          if (pp) pct = parseFloat(pp.style.width) || 0;
+        }
+        setBar(pct);
+        setPg(hasDur ? ('当前进度 ' + pct.toFixed(0) + '%') : '等待视频元数据加载…');
+        // v2.0.3：学完判定以原生 ended 事件为准（真播完才触发）。旧版用 pct>=99 判定，会在 99% 就切课，
+        // 平台未标记学完 → 返回目录又重进同一讲 → 卡在 99% 死循环。这里只作兜底：
+        // 末尾(pct>=99.9 且 currentTime 距 duration≤5s)连续 15 秒不再前进才判学完。
+        if (hasDur) {
+          if (pct >= 99.9 && v.currentTime >= (v.duration - 5)) {
+            if (nearEndSince === null) nearEndSince = Date.now();
+            if (Date.now() - nearEndSince > 15000) {
+              log('接近末尾且播放停滞 15 秒，判为学完（兜底）');
+              finish();
+              return;
+            }
+          } else {
+            nearEndSince = null;
+          }
+        }
+      }, 3000);
+    };
+
+    const tryBind = () => {
+      if (bound) return;
+      const video = findVideo();
+      if (video) bind(video);
+      else if (Date.now() - t0 < 120000) setTimeout(tryBind, 3000); // 找不到就等；看门狗负责超时兜底
+    };
+    tryBind();
+  }
+
+  // —— 看门狗（v2.0 核心修复④：黑屏/出流失败不再“强绑死 video”等死）——
+  function startVideoWatchdog() {
+    const t0 = Date.now();
+    let lastTime = -1, stallSince = 0, pausedSince = 0, healTried = false; // v2.0.5 冻结自愈
+    setInterval(() => {
+      if (!loadState().running) return;
+      // 多开限制提示（服务端拒绝出流的直接证据）
+      const txt = (document.body && document.body.innerText) || '';
+      if (/不能同时学习|同时学习多个|多个视频/.test(txt)) {
+        log('⚠️ 检测到“同时学习多个视频”类限制提示（多开被服务端拒绝）');
+        saveBreak('多开限制提示');
+        goRecover('多开限制提示');
+        return;
+      }
+      const v = findVideo();
+      if (!v) {
+        if (Date.now() - t0 > 120000) failWatchdog('页面上始终没有 video 元素');
+        return;
+      }
+      if (v.error || v.networkState === 3 /* NETWORK_NO_SOURCE */) {
+        failWatchdog('video 加载失败（error=' + (v.error ? v.error.code : '-') + '）');
+        return;
+      }
+      const hasDur = isFinite(v.duration) && v.duration > 0;
+      if (!hasDur) {
+        // v2.0.10：黑屏（元数据未就绪/无数据）→ 15s 尝试1(重绑源) → 45s 尝试2(刷新页面重建，实测有效)
+        const el = Date.now() - t0;
+        if (el > 15000 && _bsTries === 0) healBlackScreen(v);
+        else if (el > 45000 && _bsTries <= 1) healBlackScreen(v);
+        if (el > 100000) failWatchdog('video 元数据 100 秒未就绪（黑屏，自愈无效）');
+        return;
+      }
+      // 已出流：查播放是否真的在走；有数据后重置黑屏自愈计数
+      _bsTries = 0;
+      if (v.paused) {
+        if (!pausedSince) pausedSince = Date.now();
+        else if (Date.now() - pausedSince > 120000) { pausedSince = 0; nudgePlay(v); }
+      } else {
+        pausedSince = 0;
+        syncPlayerUI(v); // v2.0.4：媒体在播但 UI 停在暂停时同步
+        if (v.currentTime === lastTime) {
+          // v2.0.5：currentTime 冻结（可能被后台/遮挡节流挂起）→ 先 nudgePlay 自愈，无效再走恢复
+          if (!stallSince) stallSince = Date.now();
+          const fz = Date.now() - stallSince;
+          if (fz > 40000 && !healTried) { healTried = true; nudgePlay(v); log('检测到播放冻结(约' + Math.round(fz / 1000) + 's未推进)，已重新触发播放自愈'); }
+          if (fz > 120000) { stallSince = 0; healTried = false; failWatchdog('播放冻结 2 分钟（重播无效）'); }
+        } else { stallSince = 0; healTried = false; lastTime = v.currentTime; }
+      }
+    }, 15000);
+  }
+
+  function failWatchdog(reason) {
+    let cnt = 1;
+    try { cnt = (Number(sessionStorage.getItem('dop_fail_cnt')) || 0) + 1; sessionStorage.setItem('dop_fail_cnt', String(cnt)); } catch (e) {}
+    saveBreak('播放异常:' + reason);
+    if (cnt <= 1) {
+      log('播放异常：' + reason + ' → 刷新页面重试（1/2）');
+      setStatus('🟡 播放异常，刷新重试…');
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      log('播放异常：' + reason + ' → 刷新无效，走登录恢复链重新进入');
+      goRecover('视频加载失败:' + reason);
+    }
+  }
+
+  // v2.0.3：记录刚真正学完的讲次，防止返回目录时平台未确认完成导致重进死循环
+  function markDone() {
+    try {
+      const m = location.href.match(/lecture(ID|id)=(\d+)/);
+      if (!m) return;
+      const c = location.href.match(/cw(ID|id)=(\d+)/) || location.href.match(/trainId=(\d+)/);
+      writeJson('dongao18_recentDone', { cw: c ? c[1] : '', lec: m[2], ts: Date.now() });
+      log('已记录学完讲次 ' + m[2] + '（防重入）');
+    } catch (e) {}
+  }
+
+  function goBackToLecture() {
+    if (!loadState().running) { setStatus('🔴 已暂停，不自动切课'); return; }
+    // 有讲次列表记录 → 回列表继续下一讲；没有（单视频课）→ 回我的课程
+    let back = null;
+    try { back = sessionStorage.getItem('dongao_lecture_list'); } catch (e) {}
+    if (back) {
+      log('返回课程目录（继续下一讲）：', back);
+      go(back);
+    } else {
+      log('无列表记录（单视频课程），退回我的课程页');
+      go(myCourseUrl());
+    }
+  }
+
+  // ═══ 会话保活：防长时间挂视频 idle 掉线（保留，另加当前域轻触）═══
+  const KEEPALIVE_MS = 5 * 60 * 1000;
+  function keepAliveOnce() {
+    if (!loadState().running) return;
+    const hhmm = new Date().toTimeString().slice(0, 5);
+    const targets = [INDEX_URL + '?_ka=' + Date.now()];
+    try { targets.push(location.origin + '/?_ka=' + Date.now()); } catch (e) {}
+    targets.forEach((url, i) => {
+      try {
+        fetch(url, { mode: 'no-cors', credentials: 'include', cache: 'no-store' })
+          .then(() => { if (i === 0) log('会话保活 ✔ 已轻触学习页 ' + hhmm); })
+          .catch(() => {
+            try { const im = new Image(); im.src = url; } catch (e) {}
+          });
+      } catch (e) {
+        try { const im = new Image(); im.src = url; } catch (e2) {}
+      }
+    });
+  }
+  function startKeepAlive() {
+    if (keepAliveTimer) return;
+    log('启动会话保活：每 ' + (KEEPALIVE_MS / 60000) + ' 分钟轻触学习页，防 idle 掉线');
+    keepAliveTimer = setInterval(keepAliveOnce, KEEPALIVE_MS);
+  }
+
+  // ═══ 路由 ═══
+  let midPageTries = 0;
+  function main() {
+    // v2.2.0：URL 携带 dop_paused=1 时，保持暂停并清掉参数
+    try {
+      // v2.3.0：接收学分总进度并缓存到本域
+      const cm = (location.hash || '').match(/dop_credit=([\d.]+)\/([\d.]+)/);
+      if (cm) {
+        const t = parseFloat(cm[1]), e = parseFloat(cm[2]);
+        if (isFinite(t) && isFinite(e) && t > 0) writeJson(CREDIT_KEY, { total: t, earned: e });
+      }
+      const hm = (location.hash || '').match(/dop_paused=1|dop_run=1/);
+      if (hm) {
+        const st = loadState();
+        const wantRun = hm[0] === 'dop_run=1';
+        if (st.running !== wantRun) {
+          st.running = wantRun; saveState(st);
+          log(wantRun ? '▶ 跨页恢复运行（由上一页状态同步）' : '⏸ 跨页保持暂停（由上一页状态同步）');
+        }
+        const h = location.hash.replace(/[#&](dop_paused=1|dop_run=1|dop_credit=[\d.]+\/[\d.]+)/g, '').replace(/^#&?/, '');
+        history.replaceState(null, '', location.pathname + location.search + (h ? '#' + h : ''));
+      }
+    } catch (e) {}
+    const u = location.href;
+    const host = location.hostname;
+    const s = loadState();
+
+    // 登录续期中间页：等待自动跳转（带次数上限，防卡死）
+    if (u.indexOf('loginDeal') !== -1 || u.indexOf('/authority/') !== -1) {
+      if (++midPageTries > 40) { midPageTries = 0; goRecover('登录续期中间页卡住'); return; }
+      log('处于登录续期中间页，等待自动跳转…(' + midPageTries + '/40)');
+      setStatus('🟡 登录续期中…');
+      setTimeout(main, 1500);
+      return;
+    }
+
+    // （江西版已阉割浙里办暂停逻辑）
+
+    // 学习域之外的东奥页面（guangdong.dongao.cn 等落地页）= 会话已死 → 恢复链
+    const isLearnHost = LEARN_HOSTS.indexOf(host) !== -1;
+    if (!isLearnHost && host.indexOf('dongao.cn') !== -1) {
+      if (!s.running) { setStatus('🔴 已暂停'); return; }
+      log('落在非学习页(' + host + ')，判定会话中断');
+      setStatus('🟡 会话中断，正恢复…');
+      goRecover('落在' + host);
+      return;
+    }
+
+    if (u.indexOf('/videoShow/video/videoPlay') !== -1) onVideoPage();
+    else if (u.indexOf('/lecture/lectureList') !== -1) onLectureList();
+    else if (u.indexOf('/study/u/myCourse') !== -1) onMyCourse();
+    else if (u.indexOf('/study/index') !== -1) onIndex();
+    else {
+      // 学习域内的未知页（跳板/过渡页）：等 4 秒看会不会自动跳，不会就回学习首页
+      log('学习域未知页面，等待自动跳转：', u);
+      setStatus('🟡 过渡页，等待跳转…');
+      setTimeout(() => {
+        if (!loadState().running) return;
+        if (location.href === u) {
+          log('4 秒未自动跳转，走门户链重建会话');
+          startPortalEntry();
+        }
+      }, 4000);
+    }
+  }
+
+  // ═══ 启动 ═══
+  try {
+    createPanel();
+    const s0 = loadState();
+    if (s0.running) {
+      setStatus('🟢 运行中');
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => { createPanel(); main(); });
+      } else {
+        main();
+      }
+    } else {
+      setStatus('🔴 已暂停（点“开始”继续）');
+      setCur('脚本已加载，但处于暂停状态');
+      addLog('已暂停。点击「▶ 开始」从当前页继续自动学习。');
+    }
+  } catch (e) {
+    console.error('[东奥2.0] 初始化失败：', e);
+    try {
+      const el = document.getElementById('dop-log');
+      if (el) el.textContent += '\n❌ 初始化失败：' + e.message + '\n请截图给开发者';
+    } catch (_) {}
+  }
+})();
