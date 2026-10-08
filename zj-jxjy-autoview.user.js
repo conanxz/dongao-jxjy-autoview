@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥会计继续教育看课自动答题 v2.0
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1
+// @version      3.0.0
 // @description  自动看课答题 + 顺序切课，全程单标签。v2.0 修复：①登录态识别（未登录→尝试点登录免验证直登/等待手动登录，确认已登录才跳转，杜绝"没登录就跳→被踢→死循环"）②单标签全链路强制（window.open + target=_blank + 表单 + 中键全部改同标签，根治多开导致"不能同时学习多个视频"中断）③会话过期恢复链（落到 guangdong 等落地页自动回 jxjy 入口重新免验证登录，带循环保护防死循环）④视频黑屏/加载失败看门狗（刷新兜底 + 恢复链兜底）⑤答题循环加固（任何分支都续跑）⑥课程/讲次列表翻页 ⑦暂停恢复后各监听不丢失
 // @author       conanxz
 // @match        *://study.dongao.cn/*
@@ -20,7 +20,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.3.1';
+  const VER = '3.0.0';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
