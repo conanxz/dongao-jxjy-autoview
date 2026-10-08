@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东奥自动看课（江西挂课版）
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1-jx.1
+// @version      2.3.1-jx.2
 // @description  江西会计继续教育自动挂课版：保留自动看课、放完自动切课、黑屏自愈、答题/超时弹窗、日志导出；已阉割浙江门户链/登录识别/浙里办暂停等跳转逻辑
 // @author       conanxz
 // @match        *://*.dongao.cn/*
@@ -15,16 +15,17 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.3.1-jx.1';
+  const VER = '2.3.1-jx.2';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
   const STATE_KEY = 'dongao18_state';
   const REC_KEY = 'dongao18_rec';      // 异常恢复计数（循环保护）
   const BREAK_KEY = 'dongao18_break';  // 断点记录（诊断用）
-  const ENTRY_URL = 'https://jiangxi.dongao.cn/study/u/myCourse';
-  const INDEX_URL = 'https://jiangxi.dongao.cn/study/u/myCourse';
-  const LEARN_HOSTS = ['jiangxi.dongao.cn', 'study.dongao.cn', 'jixuweb.dongao.cn', 'jxjycwweb.dongao.cn'];
+  const ENTRY_URL = 'https://study.dongao.cn/study/u/myCourse';
+  const INDEX_URL = 'https://study.dongao.cn/study/u/myCourse';
+  const LEARN_HOSTS = ['study.dongao.cn', 'jixuweb.dongao.cn', 'jxjycwweb.dongao.cn'];
+  const MANUAL_HOSTS = ['jiangxi.dongao.cn'];   // 东奥登录页：只显示面板，不跳转不干预
   const MAX_REC = 6;                   // 30 分钟内异常恢复超过 6 次 → 判定登录卡死，自动暂停求助
   const REC_WINDOW_MS = 30 * 60 * 1000;
 
@@ -1212,6 +1213,14 @@
     const host = location.hostname;
     const s = loadState();
 
+    // jx.2：东奥登录页（jiangxi.dongao.cn 等）只显示面板，绝不跳转
+    // 江西入口链在 acc.jxf.gov.cn 政务域（@match 未覆盖，脚本不会注入），登录全程人工操作
+    if (MANUAL_HOSTS.indexOf(host) !== -1) {
+      setStatus('🟡 登录页：请手动登录后点「进入」到网校');
+      setCur('登录后进入网校（study.dongao.cn）自动开挂');
+      return;
+    }
+
     // 登录续期中间页：等待自动跳转（带次数上限，防卡死）
     if (u.indexOf('loginDeal') !== -1 || u.indexOf('/authority/') !== -1) {
       if (++midPageTries > 40) { midPageTries = 0; goRecover('登录续期中间页卡住'); return; }
@@ -1238,16 +1247,9 @@
     else if (u.indexOf('/study/u/myCourse') !== -1) onMyCourse();
     else if (u.indexOf('/study/index') !== -1) onIndex();
     else {
-      // 学习域内的未知页（跳板/过渡页）：等 4 秒看会不会自动跳，不会就回学习首页
-      log('学习域未知页面，等待自动跳转：', u);
-      setStatus('🟡 过渡页，等待跳转…');
-      setTimeout(() => {
-        if (!loadState().running) return;
-        if (location.href === u) {
-          log('4 秒未自动跳转，走门户链重建会话');
-          startPortalEntry();
-        }
-      }, 4000);
+      // jx.2：未知页只记日志，不再乱跳（江西网校页面结构未摸清，跳转会误伤）
+      log('未知页面（不干预，等平台自动跳转）：', u);
+      setStatus('🟡 未知页面，等待平台跳转…');
     }
   }
 
