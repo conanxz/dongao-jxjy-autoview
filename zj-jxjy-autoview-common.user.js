@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         东奥自动看课（江西挂课版）
+// @name         东奥自动看课（通用版）
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1-jx.2
-// @description  江西会计继续教育自动挂课版：保留自动看课、放完自动切课、黑屏自愈、答题/超时弹窗、日志导出；已阉割浙江门户链/登录识别/浙里办暂停等跳转逻辑
+// @version      2.3.2
+// @description  东奥网校通用自动挂课版：各省登录后落到 study.dongao.cn 网校即可用。保留自动看课、放完自动切课、黑屏自愈、答题/超时弹窗、日志导出；不含任何省份门户的跳转/登录逻辑，登录一律人工
 // @author       conanxz
 // @match        *://*.dongao.cn/*
 // @grant        none
@@ -15,7 +15,7 @@
 
   // 调试开关：true 时视频页 3 秒后模拟"已学完"直接触发切课，仅用于验证流程；正式使用务必 false
   const DEBUG = false;
-  const VER = '2.3.1-jx.2';
+  const VER = '2.3.2';
   const BLACKFIX = false; // v2.0.9 黑屏修复模式：true 时学完不自动切课（仅调试用），false=正常自动切课
 
   // ═══ 常量 ═══
